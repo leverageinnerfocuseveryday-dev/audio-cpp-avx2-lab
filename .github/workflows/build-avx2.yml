@@ -1,0 +1,158 @@
+name: AudioCPP 0.9.6 - Windows AVX2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audio-cpp-avx2-build
+  cancel-in-progress: false
+
+jobs:
+  build-avx2:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Obtener codigo fuente original
+        uses: actions/checkout@v4
+        with:
+          repository: 0xShug0/audio.cpp
+          ref: v0.9.6
+          submodules: recursive
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verificar version original
+        shell: pwsh
+        run: |
+          $commit = git rev-parse HEAD
+          Write-Host "Source commit: $commit"
+          if ($commit -notlike "04a37f2e*") {
+            throw "Unexpected source commit"
+          }
+
+      - name: Compilar motor AVX2
+        shell: pwsh
+        run: |
+          .\scripts\build_windows.ps1 `
+            -Preset windows-cpu-release `
+            -Target audiocpp_cli `
+            -DeploymentBuild `
+            -NativeModelManager `
+            -CpuArch avx2 `
+            -Llamafile ON `
+            -Version 0.9.6
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Compilation failed"
+          }
+
+      - name: Verificar optimizaciones
+        shell: pwsh
+        run: |
+          $cache = "build/windows-cpu-release/CMakeCache.txt"
+
+          $required = @{
+            "GGML_AVX2" = "ON"
+            "GGML_AVX512" = "OFF"
+            "ENGINE_ENABLE_NATIVE_CPU" = "OFF"
+            "ENGINE_ENABLE_LLAMAFILE" = "ON"
+            "GGML_OPENMP" = "ON"
+          }
+
+          foreach ($key in $required.Keys) {
+            $pattern = "^${key}:[^=]+=$($required[$key])$"
+            if (-not (Select-String -Path $cache -Pattern $pattern -Quiet)) {
+              throw "Invalid configuration: $key"
+            }
+            Write-Host "$key = $($required[$key])"
+          }
+
+      - name: Preparar paquete
+        shell: pwsh
+        run: |
+          $bin = "build/windows-cpu-release/bin"
+          $dist = "dist-avx2"
+
+          New-Item -ItemType Directory -Path $dist -Force
+          Copy-Item "$bin/*" $dist -Recurse -Force
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products "*" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+
+          if (-not $vs) {
+            throw "Visual Studio C++ not found"
+          }
+
+          Get-ChildItem "$vs\VC\Redist\MSVC" -Recurse -Filter *.dll |
+            Where-Object {
+              $_.FullName -match '\\x64\\Microsoft\.VC\d+\.(CRT|OpenMP[^\\]*)\\'
+            } |
+            ForEach-Object {
+              Copy-Item $_.FullName $dist -Force
+            }
+
+          Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter "libomp140.x86_64.dll" |
+            Select-Object -First 1 |
+            ForEach-Object {
+              Copy-Item $_.FullName $dist -Force
+            }
+
+          Get-ChildItem -Path . -File |
+            Where-Object {
+              $_.Name -match '^(LICENSE|COPYING|NOTICE)'
+            } |
+            Copy-Item -Destination $dist -Force
+
+          Copy-Item "build/windows-cpu-release/CMakeCache.txt" `
+            "$dist/build-configuration.txt"
+
+          git rev-parse HEAD |
+            Set-Content "$dist/source-commit.txt"
+
+      - name: Comprobar ejecutable
+        shell: pwsh
+        run: |
+          & ".\dist-avx2\audiocpp_cli.exe" --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Executable verification failed"
+          }
+
+          & ".\dist-avx2\audiocpp_cli.exe" --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "CLI verification failed"
+          }
+
+      - name: Generar huellas SHA256
+        shell: pwsh
+        run: |
+          Get-ChildItem "dist-avx2" -Recurse -File |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object {
+              "$($_.Hash)  $($_.Path.Substring((Resolve-Path 'dist-avx2').Path.Length + 1))"
+            } |
+            Set-Content "dist-avx2/SHA256SUMS.txt"
+
+      - name: Control de almacenamiento
+        shell: pwsh
+        run: |
+          $size = (Get-ChildItem "dist-avx2" -Recurse -File |
+            Measure-Object -Property Length -Sum).Sum
+
+          Write-Host "Package bytes: $size"
+
+          if ($size -gt 200MB) {
+            throw "Package exceeds authorized storage limit"
+          }
+
+      - name: Publicar paquete experimental
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-v0.9.6-windows-x64-avx2
+          path: dist-avx2/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 6
